@@ -1,0 +1,332 @@
+let state = {
+  authMode: "login",
+  verifyPurpose: null,
+  verifyEmail: null,
+  user: null,
+  menus: {},
+  content: { deals: [], subscriptions: [] },
+  cart: [],
+  config: {}
+};
+
+const $ = id => document.getElementById(id);
+const money = n => `$${Number(n).toFixed(2)}`;
+
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 2800);
+}
+
+function authError(msg) {
+  $("authError").textContent = msg || "";
+}
+
+async function api(url, options = {}) {
+  const res = await fetch(url, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Something went wrong.");
+  return data;
+}
+
+function setAuthMode(mode) {
+  state.authMode = mode;
+  $("loginTab").classList.toggle("active", mode === "login");
+  $("signupTab").classList.toggle("active", mode === "signup");
+  $("loginForm").classList.toggle("hidden", mode !== "login");
+  $("signupForm").classList.toggle("hidden", mode !== "signup");
+  $("verifyForm").classList.add("hidden");
+  $("authTitle").textContent = mode === "login" ? "Welcome back." : "Create your account.";
+  $("authSubtitle").textContent = mode === "login"
+    ? "Sign in with your Fernbrook account to order lunch."
+    : "Use your Fernbrook email to get started.";
+  authError("");
+}
+
+async function requestSignup(e) {
+  e.preventDefault();
+  authError("");
+  try {
+    const data = await api("/api/auth/signup", {
+      method: "POST",
+      body: JSON.stringify({
+        email: $("signupEmail").value,
+        firstName: $("signupFirstName").value,
+        yearLevel: $("signupYear").value
+      })
+    });
+    beginVerification("signup", $("signupEmail").value);
+    toast(data.message);
+  } catch (e) { authError(e.message); }
+}
+
+async function requestLogin(e) {
+  e.preventDefault();
+  authError("");
+  try {
+    const email = $("loginEmail").value.trim();
+    const firstName = $("loginFirstName").value.trim();
+    const yearLevel = $("loginYear").value;
+    const data = await api("/api/auth/login/request", {
+      method: "POST",
+      body: JSON.stringify({ email, firstName, yearLevel })
+    });
+    const verificationEmail = data.email || email;
+    state.verifyEmail = verificationEmail;
+    beginVerification("login", verificationEmail);
+    toast(data.message);
+  } catch (e) { authError(e.message); }
+}
+
+function beginVerification(purpose, email) {
+  state.verifyPurpose = purpose;
+  state.verifyEmail = email;
+  $("loginForm").classList.add("hidden");
+  $("signupForm").classList.add("hidden");
+  $("verifyForm").classList.remove("hidden");
+  $("verifyEmail").textContent = email || "your Fernbrook email";
+  $("verificationCode").focus();
+}
+
+function backToAuth() {
+  $("verifyForm").classList.add("hidden");
+  $(state.authMode === "login" ? "loginForm" : "signupForm").classList.remove("hidden");
+}
+
+async function verifyCode(e) {
+  e.preventDefault();
+  authError("");
+  try {
+    const data = await api("/api/auth/verify", {
+      method: "POST",
+      body: JSON.stringify({
+        email: state.verifyEmail,
+        code: $("verificationCode").value,
+        purpose: state.verifyPurpose
+      })
+    });
+    state.user = data.user;
+    showApp();
+    toast("You're signed in.");
+  } catch (e) { authError(e.message); }
+}
+
+async function boot() {
+  try {
+    const [me, menus, content, config] = await Promise.all([
+      api("/api/auth/me"),
+      api("/api/menus"),
+      api("/api/content"),
+      api("/api/config")
+    ]);
+    state.user = me.user;
+    state.menus = menus;
+    state.content = content;
+    state.config = config;
+    showApp();
+  } catch {
+    const [menus, content, config] = await Promise.all([
+      api("/api/menus"),
+      api("/api/content"),
+      api("/api/config")
+    ]);
+    state.menus = menus;
+    state.content = content;
+    state.config = config;
+  }
+}
+
+function showApp() {
+  $("authView").classList.add("hidden");
+  $("appView").classList.remove("hidden");
+  renderRestaurants();
+  renderMenu();
+  renderContent();
+  updateCartCount();
+  go("order");
+}
+
+function go(page) {
+  if (!state.user) return;
+  document.querySelectorAll(".page").forEach(x => x.classList.add("hidden"));
+  $("page-" + page).classList.remove("hidden");
+  document.querySelectorAll(".nav button").forEach(x => x.classList.toggle("active", x.dataset.page === page));
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function renderRestaurants() {
+  $("restaurants").innerHTML = Object.keys(state.menus).map(restaurant => {
+    const sections = state.menus[restaurant] || [];
+    const count = sections.reduce((a, s) => a + (s.items || []).length, 0);
+    return `<article class="restaurant-card">
+      <div class="eyebrow">RESTAURANT</div>
+      <h2>${esc(restaurant)}</h2>
+      <p>${count ? `${count} menu items available` : "Menu coming soon."}</p>
+      ${sections.slice(0, 1).map(section => (section.items || []).slice(0, 3).map(item => `
+        <div class="menu-item">
+          <div><h4>${esc(item.name)}</h4><p>${esc(item.description || "")}</p></div>
+          <div><span class="price">${item.price == null ? "Price unavailable" : money(item.price)}</span>${item.orderable ? `<button class="add" onclick='addToCart(${JSON.stringify(restaurant)},${JSON.stringify(item.id)})'>Add</button>` : ""}</div>
+        </div>`).join("")).join("")}
+      ${count ? `<button class="text-button" onclick="go('menu')">View full menu →</button>` : ""}
+    </article>`;
+  }).join("");
+}
+
+function renderMenu() {
+  $("menuContent").innerHTML = Object.entries(state.menus).map(([restaurant, sections]) => `
+    <article class="restaurant-menu">
+      <div class="eyebrow">RESTAURANT</div><h2>${esc(restaurant)}</h2>
+      ${(sections || []).map(section => `
+        <div class="section"><h3>${esc(section.section)}</h3>
+        ${(section.items || []).map(item => `
+          <div class="menu-item">
+            <div><h4>${esc(item.name)}</h4><p>${esc(item.description || "")}</p></div>
+            <div><span class="price">${item.price == null ? "Price unavailable" : money(item.price)}</span>${item.orderable ? `<button class="add" onclick='addToCart(${JSON.stringify(restaurant)},${JSON.stringify(item.id)})'>Add</button>` : ""}</div>
+          </div>`).join("")}
+        </div>`).join("")}
+      ${(!sections || !sections.length) ? `<div class="empty">Menu items haven't been added yet.</div>` : ""}
+    </article>
+  `).join("");
+}
+
+function renderContent() {
+  const deals = state.content.deals || [];
+  $("dealsContent").innerHTML = deals.length ? deals.map(d => `<article class="restaurant-card"><div class="eyebrow">DEAL</div><h2>${esc(d.title)}</h2><p>${esc(d.description || "")}</p></article>`).join("") : `<div class="empty">No deals right now.</div>`;
+  const subs = state.content.subscriptions || [];
+  $("subscriptionsContent").innerHTML = subs.length ? subs.map(d => `<article class="restaurant-card"><div class="eyebrow">SUBSCRIPTION</div><h2>${esc(d.title)}</h2><p>${esc(d.description || "")}</p></article>`).join("") : `<div class="empty">No subscriptions currently available.</div>`;
+}
+
+function addToCart(restaurant, id) {
+  const item = (state.menus[restaurant] || []).flatMap(s => s.items || []).find(i => i.id === id);
+  if (!item || !item.orderable || item.price == null) return toast("This item cannot be ordered until its price is added.");
+  const existing = state.cart.find(x => x.restaurant === restaurant && x.id === id);
+  if (existing) existing.quantity++;
+  else state.cart.push({ restaurant, id, name: item.name, price: item.price, quantity: 1 });
+  updateCartCount();
+  toast(`${item.name} added to cart.`);
+}
+
+function updateCartCount() {
+  const count = state.cart.reduce((a, x) => a + x.quantity, 0);
+  $("cartCount").textContent = count;
+  $("heroCartCount").textContent = count;
+}
+
+function openCart() {
+  $("cartModal").classList.remove("hidden");
+  renderCart();
+}
+function closeCart() { $("cartModal").classList.add("hidden"); }
+
+function cartTotals() {
+  const subtotal = Number(state.cart.reduce((a, x) => a + x.price * x.quantity, 0).toFixed(2));
+  return { subtotal, delivery: Number(state.config.deliveryFee || 3), service: Number(state.config.serviceFee || 1.25), total: Number((subtotal + Number(state.config.deliveryFee || 3) + Number(state.config.serviceFee || 1.25)).toFixed(2)) };
+}
+
+function renderCart() {
+  const totals = cartTotals();
+  if (!state.cart.length) {
+    $("cartStep").innerHTML = `<div class="page-heading"><div class="eyebrow">YOUR ORDER</div><h1>Your cart is empty.</h1><p>Add something delicious from the menu.</p></div>`;
+    return;
+  }
+  $("cartStep").innerHTML = `
+    <div class="eyebrow">YOUR ORDER</div><h1>Cart</h1>
+    ${state.cart.map((x,i) => `<div class="cart-line">
+      <div><strong>${esc(x.name)}</strong><div class="muted">${esc(x.restaurant)}</div></div>
+      <div class="qty"><button onclick="changeQty(${i},-1)">−</button> <strong>${x.quantity}</strong> <button onclick="changeQty(${i},1)">+</button></div>
+      <div class="line-price">${money(x.price*x.quantity)}</div>
+    </div>`).join("")}
+    <div class="summary">
+      <div class="summary-row"><span>Subtotal</span><span>${money(totals.subtotal)}</span></div>
+      <div class="summary-row"><span>Delivery fee</span><span>${money(totals.delivery)}</span></div>
+      <div class="summary-row"><span>Service fee</span><span>${money(totals.service)}</span></div>
+      <div class="summary-row total"><span>Total</span><span>${money(totals.total)}</span></div>
+    </div>
+    <button class="primary full confirm" onclick="showCheckout()">Continue to checkout</button>`;
+}
+
+function changeQty(i, delta) {
+  state.cart[i].quantity += delta;
+  if (state.cart[i].quantity <= 0) state.cart.splice(i,1);
+  updateCartCount(); renderCart();
+}
+
+function showCheckout() {
+  const minDate = new Date().toISOString().slice(0,10);
+  $("cartStep").innerHTML = `
+    <div class="eyebrow">CHECKOUT</div><h1>Choose your date.</h1>
+    <div class="checkout">
+      <label>Order / delivery date<input id="deliveryDate" type="date" min="${minDate}" required></label>
+      <label>Payment method<select id="paymentMethod" onchange="renderPaymentBox()"><option value="">Choose</option><option value="bsb">BSB</option><option value="cash">Cash</option></select></label>
+      <div id="paymentBox"></div>
+      <button class="primary full confirm" onclick="confirmOrder()">Confirm order</button>
+    </div>`;
+}
+
+function renderPaymentBox() {
+  const method = $("paymentMethod").value;
+  if (method === "bsb") {
+    $("paymentBox").innerHTML = `<div class="payment-box"><strong>Please pay the total amount, including delivery and service fees:</strong><br><br><strong>BSB:</strong> 013402<br><strong>Account:</strong> 816789315</div>`;
+  } else if (method === "cash") {
+    $("paymentBox").innerHTML = `<div class="payment-box"><strong>Please meet Miles at recess on the day of ordering to confirm and pay.</strong></div>`;
+  } else $("paymentBox").innerHTML = "";
+}
+
+async function confirmOrder() {
+  const deliveryDate = $("deliveryDate").value;
+  const paymentMethod = $("paymentMethod").value;
+  if (!deliveryDate || !paymentMethod) return toast("Choose a date and payment method.");
+  try {
+    const data = await api("/api/orders", {
+      method: "POST",
+      body: JSON.stringify({
+        deliveryDate,
+        paymentMethod,
+        items: state.cart.map(x => ({ restaurant: x.restaurant, id: x.id, quantity: x.quantity }))
+      })
+    });
+    state.cart = [];
+    updateCartCount();
+    renderConfirmation(data.order);
+  } catch (e) { toast(e.message); }
+}
+
+function renderConfirmation(order) {
+  $("cartStep").innerHTML = `
+    <div class="success">
+      <div class="eyebrow">ORDER CONFIRMED</div>
+      <h2>Thanks, ${esc(order.firstName)}!</h2>
+      <p>Your order has been received.</p>
+      <p><strong>Status:</strong> ${esc(order.status)}<br><strong>Date:</strong> ${esc(order.deliveryDate)}<br><strong>Payment:</strong> ${esc(order.paymentMethod.toUpperCase())}</p>
+      <hr>
+      ${order.items.map(i => `<p><strong>${i.quantity}× ${esc(i.name)}</strong><br><span class="muted">${esc(i.restaurant)} · ${money(i.lineTotal)}</span></p>`).join("")}
+      <div class="summary">
+        <div class="summary-row"><span>Subtotal</span><span>${money(order.subtotal)}</span></div>
+        <div class="summary-row"><span>Delivery</span><span>${money(order.deliveryFee)}</span></div>
+        <div class="summary-row"><span>Service</span><span>${money(order.serviceFee)}</span></div>
+        <div class="summary-row total"><span>Total</span><span>${money(order.total)}</span></div>
+      </div>
+    </div>`;
+}
+
+function openAccount() {
+  if (!state.user) return;
+  const name = state.user.first_name;
+  $("cartStep").innerHTML = `<div class="eyebrow">ACCOUNT</div><h1>${esc(name)}</h1><p>${esc(state.user.email)}<br>Year ${esc(state.user.year_level)}</p><button class="primary" onclick="logout()">Log out</button>`;
+  $("cartModal").classList.remove("hidden");
+}
+
+async function logout() {
+  await api("/api/auth/logout", {method:"POST"});
+  location.reload();
+}
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+}
+
+boot();

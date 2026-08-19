@@ -1,0 +1,223 @@
+require("dotenv").config();
+const express = require("express");
+const path = require("path");
+const fs = require("fs");
+const crypto = require("crypto");
+const cookieParser = require("cookie-parser");
+const jwt = require("jsonwebtoken");
+const nodemailer = require("nodemailer");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const JWT_SECRET = process.env.JWT_SECRET || "change-this-in-render";
+const MARKUP_PERCENT = Number(process.env.MARKUP_PERCENT || 25);
+const DELIVERY_FEE = 3;
+const SERVICE_FEE = 1.25;
+const DATA = path.join(__dirname, "data");
+
+const USERS = path.join(DATA, "users.json");
+const CODES = path.join(DATA, "codes.json");
+const ORDERS = path.join(DATA, "orders.json");
+const MENUS = path.join(DATA, "menus.json");
+const CONTENT = path.join(DATA, "content.json");
+
+for (const [f,v] of [[USERS,[]],[CODES,[]],[ORDERS,[]]]) {
+  if (!fs.existsSync(f)) fs.writeFileSync(f, JSON.stringify(v,null,2));
+}
+const read = (f, fallback=[]) => { try { return JSON.parse(fs.readFileSync(f,"utf8")); } catch { return fallback; } };
+const write = (f,v) => fs.writeFileSync(f, JSON.stringify(v,null,2));
+
+app.use(helmet({contentSecurityPolicy:false}));
+app.use(express.json({limit:"100kb"}));
+app.use(cookieParser());
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
+app.get("/styles.css", (req, res) => res.sendFile(path.join(__dirname, "styles.css")));
+app.get("/app.js", (req, res) => res.sendFile(path.join(__dirname, "app.js")));
+
+app.use(express.static(path.join(__dirname,"public")));
+
+const verifyLimiter = rateLimit({windowMs:10*60*1000,limit:10});
+const orderLimiter = rateLimit({windowMs:10*60*1000,limit:20});
+
+const YEARS = (process.env.ALLOWED_YEAR_LEVELS || "7,8,9,10,11,12").split(",").map(x=>x.trim());
+const normEmail = e => String(e||"").trim().toLowerCase();
+const validEmail = e => /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@fernbrook\.com\.au$/i.test(e);
+const validName = n => /^[A-Za-zÀ-ÖØ-öø-ÿ' -]{1,40}$/.test(String(n||"").trim());
+const validYear = y => YEARS.includes(String(y||"").trim());
+const makeCode = () => String(crypto.randomInt(0,1000000)).padStart(6,"0");
+const codeHash = c => crypto.createHash("sha256").update(`${c}:${JWT_SECRET}`).digest("hex");
+
+function publicUser(u){ return {id:u.id,email:u.email,first_name:u.firstName,year_level:u.yearLevel}; }
+function setSession(res,u){
+  res.cookie("session", jwt.sign({sub:u.id},JWT_SECRET,{expiresIn:"14d"}), {
+    httpOnly:true, sameSite:"lax", secure:process.env.COOKIE_SECURE==="true",
+    maxAge:14*24*60*60*1000
+  });
+}
+function auth(req,res,next){
+  try{
+    const p=jwt.verify(req.cookies.session||"",JWT_SECRET);
+    const u=read(USERS).find(x=>x.id===p.sub);
+    if(!u) throw 0;
+    req.user=u; next();
+  }catch{ res.status(401).json({error:"Please sign in."}); }
+}
+async function sendCode(email,code){
+  if(!process.env.SMTP_HOST){
+    console.log(`Verification code for ${email}: ${code}`);
+    return {};
+  }
+  const tx=nodemailer.createTransport({
+    host:process.env.SMTP_HOST,
+    port:Number(process.env.SMTP_PORT||587),
+    secure:process.env.SMTP_SECURE==="true",
+    auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}
+  });
+  await tx.sendMail({
+    from:process.env.SMTP_FROM,
+    to:email,
+    subject:"Fernbrook Food verification code",
+    text:`Your verification code is ${code}. It expires in 10 minutes.`
+  });
+}
+async function discord(embed){
+  const url=process.env.DISCORD_WEBHOOK_URL;
+  if(!url) return;
+  const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:"Fernbrook Food",embeds:[embed]})});
+  if(!r.ok) throw new Error(`Discord webhook failed: ${r.status}`);
+}
+function saveCode(email,purpose,payload,code){
+  let a=read(CODES);
+  a=a.filter(x=>!(x.email===email&&x.purpose===purpose));
+  a.push({id:crypto.randomUUID(),email,purpose,payload,hash:codeHash(code),expires:Date.now()+600000,attempts:0});
+  write(CODES,a);
+}
+function publicMenus(){
+  const menus=read(MENUS,{});
+  const out={};
+  for(const [restaurant,sections] of Object.entries(menus)){
+    out[restaurant]=(sections||[]).map(s=>({
+      section:s.section,
+      items:(s.items||[]).filter(i=>i.available!==false).map(i=>{
+        const priced=i.price!==null&&i.price!==undefined&&Number.isFinite(Number(i.price));
+        return {
+          id:i.id,name:i.name,description:i.description||"",
+          orderable:i.orderable!==false&&priced,
+          price:priced?Number((Number(i.price)*(1+MARKUP_PERCENT/100)).toFixed(2)):null
+        };
+      })
+    }));
+  }
+  return out;
+}
+function pricedCart(items){
+  if(!Array.isArray(items)||!items.length||items.length>100) throw new Error("Invalid cart.");
+  const lookup=new Map();
+  const menus=read(MENUS,{});
+  for(const [restaurant,sections] of Object.entries(menus)){
+    for(const s of sections||[]) for(const i of s.items||[]){
+      if(i.available!==false&&i.orderable!==false&&i.price!=null&&Number.isFinite(Number(i.price))){
+        lookup.set(`${restaurant}::${i.id}`,{restaurant,id:i.id,name:i.name,price:Number((Number(i.price)*(1+MARKUP_PERCENT/100)).toFixed(2))});
+      }
+    }
+  }
+  return items.map(x=>{
+    const q=Number(x.quantity), i=lookup.get(`${x.restaurant}::${x.id}`);
+    if(!i||!Number.isInteger(q)||q<1||q>99) throw new Error("One or more cart items are invalid.");
+    return {...i,quantity:q,lineTotal:Number((i.price*q).toFixed(2))};
+  });
+}
+
+app.get("/health",(req,res)=>res.json({ok:true}));
+app.get("/api/config",(req,res)=>res.json({deliveryFee:DELIVERY_FEE,serviceFee:SERVICE_FEE,markupPercent:MARKUP_PERCENT}));
+app.get("/api/menus",(req,res)=>res.json(publicMenus()));
+app.get("/api/content",(req,res)=>res.json(read(CONTENT,{deals:[],subscriptions:[]})));
+
+app.post("/api/auth/signup",verifyLimiter,async(req,res)=>{
+  try{
+    const email=normEmail(req.body.email), firstName=String(req.body.firstName||"").trim(), yearLevel=String(req.body.yearLevel||"").trim();
+    if(!validEmail(email)) return res.status(400).json({error:"Use an email ending in @fernbrook.com.au."});
+    if(!validName(firstName)) return res.status(400).json({error:"Enter a valid first name."});
+    if(!validYear(yearLevel)) return res.status(400).json({error:"Select a valid year level."});
+    if(read(USERS).some(u=>u.email===email)) return res.status(409).json({error:"That account already exists."});
+    const code=makeCode(); saveCode(email,"signup",{firstName,yearLevel},code); await sendCode(email,code);
+    res.json({ok:true,email,message:"Verification code sent."});
+  }catch(e){console.error(e);res.status(500).json({error:"Could not send the verification code."});}
+});
+
+app.post("/api/auth/login/request",verifyLimiter,async(req,res)=>{
+  try{
+    const email=normEmail(req.body.email), firstName=String(req.body.firstName||"").trim(), yearLevel=String(req.body.yearLevel||"").trim();
+    const users=read(USERS); let user;
+    if(email){
+      if(!validEmail(email)) return res.status(400).json({error:"Use your Fernbrook email."});
+      user=users.find(u=>u.email===email);
+    }else{
+      if(!validName(firstName)||!validYear(yearLevel)) return res.status(400).json({error:"Enter your first name and year level."});
+      const matches=users.filter(u=>u.firstName.toLowerCase()===firstName.toLowerCase()&&u.yearLevel===yearLevel);
+      if(matches.length>1) return res.status(409).json({error:"More than one account matches. Use email login."});
+      user=matches[0];
+    }
+    if(!user) return res.status(404).json({error:"No account matched those details."});
+    const code=makeCode(); saveCode(user.email,"login",{},code); await sendCode(user.email,code);
+    res.json({ok:true,email:user.email,message:"Verification code sent."});
+  }catch(e){console.error(e);res.status(500).json({error:"Could not send the verification code."});}
+});
+
+app.post("/api/auth/verify",verifyLimiter,async(req,res)=>{
+  try{
+    const email=normEmail(req.body.email), purpose=String(req.body.purpose||""), code=String(req.body.code||"").trim();
+    if(!validEmail(email)||!["signup","login"].includes(purpose)||!/^\d{6}$/.test(code)) return res.status(400).json({error:"Invalid verification request."});
+    let codes=read(CODES), rec=codes.find(x=>x.email===email&&x.purpose===purpose);
+    if(!rec||rec.expires<Date.now()) return res.status(400).json({error:"Code expired. Request another."});
+    if(rec.attempts>=5) return res.status(429).json({error:"Too many attempts."});
+    if(rec.hash!==codeHash(code)){rec.attempts++;write(CODES,codes);return res.status(400).json({error:"Incorrect verification code."});}
+    let users=read(USERS), user;
+    if(purpose==="signup"){
+      user={id:crypto.randomUUID(),email,firstName:rec.payload.firstName,yearLevel:rec.payload.yearLevel,createdAt:new Date().toISOString()};
+      users.push(user); write(USERS,users);
+      discord({title:"New verified account",fields:[
+        {name:"Email",value:user.email},{name:"First name",value:user.firstName},{name:"Year level",value:user.yearLevel}
+      ],timestamp:new Date().toISOString()}).catch(console.error);
+    }else{
+      user=users.find(u=>u.email===email);
+      if(!user) return res.status(404).json({error:"Account not found."});
+    }
+    write(CODES,codes.filter(x=>x.id!==rec.id));
+    setSession(res,user);
+    res.json({ok:true,user:publicUser(user)});
+  }catch(e){console.error(e);res.status(500).json({error:"Verification failed."});}
+});
+
+app.get("/api/auth/me",auth,(req,res)=>res.json({user:publicUser(req.user)}));
+app.post("/api/auth/logout",(req,res)=>{res.clearCookie("session");res.json({ok:true});});
+
+app.post("/api/orders",auth,orderLimiter,async(req,res)=>{
+  try{
+    const deliveryDate=String(req.body.deliveryDate||""), paymentMethod=String(req.body.paymentMethod||"").toLowerCase();
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(deliveryDate)) return res.status(400).json({error:"Choose a valid delivery date."});
+    if(!["bsb","cash"].includes(paymentMethod)) return res.status(400).json({error:"Choose a payment method."});
+    const items=pricedCart(req.body.items);
+    const subtotal=Number(items.reduce((s,i)=>s+i.lineTotal,0).toFixed(2));
+    const total=Number((subtotal+DELIVERY_FEE+SERVICE_FEE).toFixed(2));
+    const order={id:crypto.randomUUID(),userId:req.user.id,firstName:req.user.firstName,email:req.user.email,yearLevel:req.user.yearLevel,deliveryDate,paymentMethod,items,subtotal,deliveryFee:DELIVERY_FEE,serviceFee:SERVICE_FEE,total,status:"confirmed",createdAt:new Date().toISOString()};
+    const orders=read(ORDERS);orders.push(order);write(ORDERS,orders);
+    await discord({title:`New order #${order.id.slice(0,8)}`,fields:[
+      {name:"Customer",value:`${order.firstName} (${order.email})`},
+      {name:"Year level",value:order.yearLevel},
+      {name:"Delivery date",value:order.deliveryDate},
+      {name:"Payment",value:order.paymentMethod.toUpperCase()},
+      {name:"Items",value:items.map(i=>`${i.quantity}× ${i.name} — ${i.restaurant} — $${i.lineTotal.toFixed(2)}`).join("\n").slice(0,1024)},
+      {name:"Subtotal",value:`$${subtotal.toFixed(2)}`},
+      {name:"Delivery fee",value:`$${DELIVERY_FEE.toFixed(2)}`},
+      {name:"Service fee",value:`$${SERVICE_FEE.toFixed(2)}`},
+      {name:"Total",value:`$${total.toFixed(2)}`}
+    ],timestamp:new Date().toISOString()});
+    res.json({ok:true,order});
+  }catch(e){console.error(e);res.status(400).json({error:e.message||"Could not create order."});}
+});
+
+app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));
+app.listen(PORT,()=>console.log(`Fernbrook Food running on http://localhost:${PORT}`));
